@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<policyconfig>
+  <vendor>deb-installer</vendor>
+  <icon_name>local.DebInstaller</icon_name>
+
+  <!-- The helper accepts no paths and no apt options; argv1 selects which message the user sees. -->
+  <action id="local.DebInstaller.install">
+    <description>Install a package from a file</description>
+    <description xml:lang="ru">Установка пакета из файла</description>
+    <message>Authentication is required to install a package from a file</message>
+    <message xml:lang="ru">Для установки пакета из файла требуется аутентификация</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/libexec/deb-installer/helper</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">install</annotate>
+  </action>
+
+  <action id="local.DebInstaller.remove">
+    <description>Remove a program</description>
+    <description xml:lang="ru">Удаление программы</description>
+    <message>Authentication is required to remove a program</message>
+    <message xml:lang="ru">Для удаления программы требуется аутентификация</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/libexec/deb-installer/helper</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">remove</annotate>
+  </action>
+</policyconfig>

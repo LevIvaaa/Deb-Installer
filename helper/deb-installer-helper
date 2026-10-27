@@ -1,0 +1,293 @@
+#!/usr/bin/python3 -I
+"""Privileged half of deb-installer. Started only through pkexec (polkit actions
+local.DebInstaller.install / local.DebInstaller.remove).
+
+  install --sha256 HEX --size BYTES [--reinstall] [--allow-downgrade]   (.deb on stdin)
+  remove  --package NAME --expect NAME[,NAME...] [--purge]
+
+The caller never passes a path or an apt option: the package arrives on stdin and is
+checked against the fingerprint the user saw, and removals must match the set the user
+confirmed. Progress goes to stdout as JSON lines.
+"""
+import argparse
+import hashlib
+import json
+import os
+import re
+import selectors
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+
+CACHE = "/var/cache/deb-installer"
+MAX_SIZE = 16 << 30
+NAME_RE = re.compile(r"^[a-z0-9][a-z0-9+.-]+(:[a-z0-9]+)?$")
+SHA_RE = re.compile(r"^[0-9a-f]{64}$")
+PROTECTED = re.compile(
+    r"^(apt|dpkg|libc6|libc-bin|base-files|base-passwd|bash|coreutils|rust-coreutils|gnu-coreutils"
+    r"|init|init-system-helpers|systemd|systemd-sysv|udev|sudo|sudo-rs|polkitd|pkexec|login|passwd"
+    r"|gdm3|gnome-shell|mutter|network-manager|grub.*|shim.*|linux-(image|headers|modules|generic).*"
+    r"|ubuntu-(desktop|desktop-minimal|minimal|standard|server)|deb-installer)(:[a-z0-9]+)?$")
+ENV = {
+    "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
+    "LC_ALL": "C.UTF-8",
+    "DEBIAN_FRONTEND": "noninteractive",
+    "APT_LISTCHANGES_FRONTEND": "none",
+    "NEEDRESTART_SUSPEND": "1",
+}
+COMMON = ["-q", "-o", "DPkg::Lock::Timeout=300", "-o", "Dpkg::Use-Pty=0", "-o", "APT::Color=0"]
+CONF = ["-o", "Dpkg::Options::=--force-confdef", "-o", "Dpkg::Options::=--force-confold"]
+
+
+class Refused(Exception):
+    """A check failed before anything changed on the system."""
+
+    def __init__(self, reason, detail=""):
+        super().__init__(reason)
+        self.reason, self.detail = reason, detail
+
+
+def emit(kind, **fields):
+    # The window may be closed mid-install; losing the reader must never stop dpkg.
+    try:
+        sys.stdout.write(json.dumps({"t": kind, **fields}, ensure_ascii=False) + "\n")
+        sys.stdout.flush()
+    except (BrokenPipeError, OSError):
+        pass
+
+
+def run(cmd):
+    return subprocess.run(cmd, env=ENV, stdin=subprocess.DEVNULL, capture_output=True, text=True)
+
+
+def allowed_archs():
+    native = run(["dpkg", "--print-architecture"]).stdout.split()
+    foreign = run(["dpkg", "--print-foreign-architectures"]).stdout.split()
+    return {"all", *native, *foreign}
+
+
+def installed_version(name):
+    r = run(["dpkg-query", "-W", "-f=${db:Status-Status}\t${Version}", name])
+    status, _, version = r.stdout.partition("\t")
+    return version if r.returncode == 0 and status in ("installed", "half-configured", "unpacked",
+                                                         "half-installed", "triggers-awaited",
+                                                         "triggers-pending") else None
+
+
+def is_protected(name):
+    if PROTECTED.match(name):
+        return True
+    r = run(["dpkg-query", "-W", "-f=${Essential}\t${Priority}", name])
+    essential, _, priority = r.stdout.partition("\t")
+    return r.returncode == 0 and (essential == "yes" or priority in ("required", "important"))
+
+
+def receive(sha256, size):
+    """Copy the .deb from stdin into a root-owned transaction dir, verifying size and hash."""
+    os.makedirs(CACHE, mode=0o755, exist_ok=True)
+    if shutil.disk_usage(CACHE).free < size * 2 + (256 << 20):
+        raise Refused("space")
+    tx = tempfile.mkdtemp(prefix="tx-", dir=CACHE)
+    try:
+        os.chmod(tx, 0o755)  # _apt must be able to read the file, nobody else may write
+        path = os.path.join(tx, "pkg.deb")
+        digest, total = hashlib.sha256(), 0
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+        with os.fdopen(fd, "wb") as out:
+            while chunk := sys.stdin.buffer.read(1 << 20):
+                total += len(chunk)
+                if total > size:
+                    break
+                digest.update(chunk)
+                out.write(chunk)
+        if total != size:
+            raise Refused("size", f"{total} != {size}")
+        if digest.hexdigest() != sha256:
+            raise Refused("sha256")
+        return tx, path
+    except BaseException:
+        shutil.rmtree(tx, ignore_errors=True)
+        raise
+
+
+def deb_fields(path):
+    r = run(["dpkg-deb", "-f", path])
+    if r.returncode != 0:
+        raise Refused("invalid", r.stderr.strip())
+    fields, key = {}, None
+    for line in r.stdout.splitlines():
+        if line[:1] in (" ", "\t") and key:
+            fields[key] += "\n" + line
+        elif ":" in line:
+            key, _, value = line.partition(":")
+            fields[key] = value.strip()
+    whole = subprocess.run(["dpkg-deb", "--fsys-tarfile", path], env=ENV, stdin=subprocess.DEVNULL,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    if whole.returncode != 0:
+        raise Refused("invalid", whole.stderr.strip() or "data archive is truncated or corrupt")
+    return fields
+
+
+def simulate(args):
+    r = run(["apt-get", "-s", *COMMON, *args])
+    inst, remove, in_removed = [], [], False
+    for line in r.stdout.splitlines():
+        m = re.match(r"^Inst (\S+) (?:\[(\S+)\] )?\((\S+)", line)
+        if m:
+            inst.append({"name": m.group(1), "old": m.group(2), "new": m.group(3)})
+        elif line.startswith(("Remv ", "Purg ")):
+            remove.append(line.split()[1])
+        elif line.startswith("The following packages will be REMOVED"):
+            in_removed = True  # with --no-remove apt stops before printing Remv lines
+            continue
+        if in_removed:
+            if line.startswith(" "):
+                remove.extend(n.rstrip("*") for n in line.split())
+            else:
+                in_removed = False
+    return r.returncode, inst, list(dict.fromkeys(remove)), (r.stdout + r.stderr).strip()
+
+
+def stream(cmd):
+    """Run apt-get, forwarding its log and its machine-readable status as JSON events."""
+    status_r, status_w = os.pipe()
+    proc = subprocess.Popen(cmd + ["-o", f"APT::Status-Fd={status_w}"], env=ENV, stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, pass_fds=(status_w,),
+                            start_new_session=True)
+    os.close(status_w)
+    sel, buffers, log = selectors.DefaultSelector(), {}, []
+    for f in (proc.stdout.fileno(), status_r):
+        os.set_blocking(f, False)
+        sel.register(f, selectors.EVENT_READ)
+        buffers[f] = b""
+    while sel.get_map():
+        for key, _ in sel.select():
+            chunk = os.read(key.fd, 65536)
+            if not chunk:
+                sel.unregister(key.fd)
+                chunk = b"\n" if buffers[key.fd] else b""
+            buffers[key.fd] += chunk
+            *lines, buffers[key.fd] = buffers[key.fd].split(b"\n")
+            for raw in lines:
+                line = raw.decode("utf-8", "replace").rstrip("\r")
+                if not line:
+                    continue
+                if key.fd == status_r:
+                    kind, _, rest = line.partition(":")
+                    item, pct, text = (rest.split(":", 2) + ["", ""])[:3]
+                    if kind in ("dlstatus", "pmstatus"):
+                        emit("progress", stage="download" if kind == "dlstatus" else "dpkg",
+                             pct=float(pct or 0), item=item, text=text)
+                    elif kind == "pmerror":
+                        emit("pmerror", item=item, text=text)
+                else:
+                    log.append(line)
+                    emit("log", line=line)
+    os.close(status_r)
+    return proc.wait(), "\n".join(log)
+
+
+def rollback(new_names):
+    present = [n for n in new_names if installed_version(n) is not None]
+    if not present:
+        return True
+    emit("phase", name="rollback", packages=present)
+    rc, _, removing, _ = simulate(["purge", *present])
+    if rc != 0 or not set(removing) <= set(present):
+        emit("log", line="rollback skipped: purge would touch other packages")
+        return False
+    rc, _ = stream(["apt-get", "-y", *COMMON, "purge", *present])
+    return rc == 0
+
+
+def cmd_install(a):
+    if not SHA_RE.match(a.sha256) or not 0 < a.size <= MAX_SIZE:
+        raise Refused("args")
+    emit("phase", name="verify")
+    tx, path = receive(a.sha256, a.size)
+    try:
+        fields = deb_fields(path)
+        name, version = fields.get("Package", ""), fields.get("Version", "")
+        if not NAME_RE.match(name):
+            raise Refused("invalid", "bad package name")
+        if fields.get("Architecture") not in allowed_archs():
+            raise Refused("arch", fields.get("Architecture", ""))
+        if is_protected(name):
+            raise Refused("protected", name)
+        emit("verified", package=name, version=version)
+        extra = (["--reinstall"] if a.reinstall else []) + (["--allow-downgrades"] if a.allow_downgrade else [])
+        rc, inst, remove, out = simulate(["--no-remove", *extra, "install", path])
+        if remove:
+            raise Refused("remove", " ".join(remove))
+        if rc != 0:
+            raise Refused("simulate", out)
+        before = installed_version(name)
+        new = [p["name"] for p in inst if p["old"] is None and installed_version(p["name"]) is None]
+        emit("plan", install=[p["name"] for p in inst])
+        cmd = ["apt-get", "-y", "--no-remove", *COMMON, *CONF, *extra, "install", path]
+        emit("phase", name="apply")
+        rc, log = stream(cmd)
+        if rc != 0 and ("Unable to fetch" in log or "404" in log):
+            emit("phase", name="update")
+            stream(["apt-get", *COMMON, "update"])
+            emit("phase", name="apply")
+            rc, log = stream(cmd)
+        if rc == 0:
+            emit("done", ok=True)
+            return 0
+        rolled = before is None and rollback(new)
+        emit("done", ok=False, rolled_back=rolled, log=log[-20000:])
+        return 3
+    finally:
+        shutil.rmtree(tx, ignore_errors=True)
+
+
+def cmd_remove(a):
+    expect = {n for n in a.expect.split(",") if n}
+    if not NAME_RE.match(a.package) or not expect or not all(NAME_RE.match(n) for n in expect):
+        raise Refused("args")
+    if is_protected(a.package):
+        raise Refused("protected", a.package)
+    purge = ["--purge"] if a.purge else []
+    rc, _, removing, out = simulate([*purge, "remove", a.package])
+    if rc != 0:
+        raise Refused("simulate", out)
+    if set(removing) != expect:
+        raise Refused("changed", " ".join(sorted(removing)))
+    if blocked := [n for n in removing if is_protected(n)]:
+        raise Refused("protected", " ".join(blocked))
+    emit("phase", name="apply")
+    rc, log = stream(["apt-get", "-y", *COMMON, *purge, "remove", a.package])
+    emit("done", ok=rc == 0, log=log[-20000:] if rc else "")
+    return 0 if rc == 0 else 3
+
+
+def main():
+    for sig in (signal.SIGINT, signal.SIGHUP, signal.SIGTERM, signal.SIGQUIT):
+        signal.signal(sig, signal.SIG_IGN)  # never leave dpkg half-done
+    if os.geteuid() != 0:
+        print("must run as root via pkexec", file=sys.stderr)
+        return 4
+    p = argparse.ArgumentParser(prog="deb-installer-helper", allow_abbrev=False)
+    sub = p.add_subparsers(dest="cmd", required=True)
+    i = sub.add_parser("install", allow_abbrev=False)
+    i.add_argument("--sha256", required=True)
+    i.add_argument("--size", type=int, required=True)
+    i.add_argument("--reinstall", action="store_true")
+    i.add_argument("--allow-downgrade", action="store_true")
+    r = sub.add_parser("remove", allow_abbrev=False)
+    r.add_argument("--package", required=True)
+    r.add_argument("--expect", required=True)
+    r.add_argument("--purge", action="store_true")
+    a = p.parse_args()
+    try:
+        return cmd_install(a) if a.cmd == "install" else cmd_remove(a)
+    except Refused as e:
+        emit("refused", reason=e.reason, detail=e.detail)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

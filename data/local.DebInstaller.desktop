@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Name=Package Installer
+Name[ru]=Установщик пакетов
+GenericName=Install and remove programs
+GenericName[ru]=Установка и удаление программ
+Comment=Check and install .deb packages, remove programs
+Comment[ru]=Проверка и установка .deb-пакетов, удаление программ
+Exec=deb-installer %F
+Icon=local.DebInstaller
+Terminal=false
+StartupNotify=true
+Categories=GTK;System;PackageManager;
+MimeType=application/vnd.debian.binary-package;application/x-deb;application/x-debian-package;
+Keywords=deb;package;install;uninstall;remove;пакет;установка;удаление;программы;
